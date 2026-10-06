@@ -26,8 +26,14 @@ jobs:
           packages: 'platform-tools platforms;android-35 build-tools;35.0.0'
           log-accepted-android-sdk-licenses: false
       - uses: gradle/actions/setup-gradle@v4
+      - name: Create temporary CI signing key
+        run: |
+          keytool -genkeypair -noprompt -keystore "$RUNNER_TEMP/ironlog-ci-debug.keystore" \
+            -storepass android -keypass android -alias androiddebugkey \
+            -keyalg RSA -keysize 2048 -validity 2 \
+            -dname "CN=Android Debug,O=Android,C=US"
       - name: Build debug app and run unit tests
-        run: bash ./gradlew --no-daemon testDebugUnitTest assembleDebug
+        run: bash ./gradlew --no-daemon -PironlogDebugKeystore="$RUNNER_TEMP/ironlog-ci-debug.keystore" testDebugUnitTest assembleDebug
 
   legacy-relay:
     runs-on: ubuntu-latest
