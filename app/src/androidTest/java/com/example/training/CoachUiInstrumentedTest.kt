@@ -66,21 +66,9 @@ class CoachUiInstrumentedTest {
         compose.onNodeWithText("接続方法：ChatGPT").assertIsDisplayed()
         compose.onNodeWithText("ChatGPTの利用状況を開く").assertIsDisplayed()
         saveScreenshot("coach-chatgpt-settings-test.png")
-        compose.onNodeWithText("詳細設定").performScrollTo().performClick()
-        compose.onNodeWithText("家のPCへの接続を使う").performScrollTo().performClick()
-        compose.waitUntil(10_000) {
-            compose.onAllNodes(hasText("PCの接続設定") and isEnabled()).fetchSemanticsNodes().isNotEmpty()
-        }
-        compose.onNodeWithText("PCの接続設定").performScrollTo().performClick()
-        compose.onNodeWithText("家のPCへの接続").assertIsDisplayed()
-        compose.onNodeWithText("接続情報を貼り付け").assertIsDisplayed()
-        compose.onNodeWithText("保存").assertIsDisplayed()
-        saveScreenshot("coach-settings-test.png")
-        compose.onNodeWithText("閉じる").performClick()
-        compose.onNodeWithText("ChatGPTへの直接接続を使う").performScrollTo().performClick()
-        compose.waitUntil(10_000) {
-            compose.onAllNodes(hasText("接続方法：ChatGPT")).fetchSemanticsNodes().isNotEmpty()
-        }
+        compose.onNodeWithText("詳細設定").assertDoesNotExist()
+        compose.onNodeWithText("家のPCへの接続を使う").assertDoesNotExist()
+        compose.onNodeWithText("PCの接続設定").assertDoesNotExist()
         compose.onNodeWithText("閉じる").performClick()
 
         compose.onNodeWithText("記録").performClick()

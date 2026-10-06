@@ -5,7 +5,7 @@
             <certificates src="system" />
         </trust-anchors>
     </base-config>
-    <!-- Only in-device development callbacks may use HTTP. Remote relays require TLS. -->
+    <!-- OAuth receives browser callbacks only through this device's loopback listener. -->
     <domain-config cleartextTrafficPermitted="true">
         <domain includeSubdomains="false">127.0.0.1</domain>
         <domain includeSubdomains="false">localhost</domain>

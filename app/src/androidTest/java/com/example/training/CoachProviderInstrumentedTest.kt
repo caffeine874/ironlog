@@ -1,9 +1,5 @@
 package com.example.training
 
-import android.content.Context
-import android.content.ContextWrapper
-import android.database.DatabaseErrorHandler
-import android.database.sqlite.SQLiteDatabase
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import kotlinx.coroutines.CoroutineScope
@@ -28,89 +24,83 @@ import java.util.UUID
 /** All data is synthetic and isolated. No browser, account, or external server is contacted. */
 @RunWith(AndroidJUnit4::class)
 class CoachProviderInstrumentedTest {
-    @Test fun directIsDefaultAndOldPendingCannotBeSentThroughTheNewProvider() = runBlocking {
+    @Test fun oldSettingsRemainIntactAndOldPendingNeverCrossesToTheDirectAccount() = runBlocking {
         val target = InstrumentationRegistry.getInstrumentation().targetContext
-        val context = ProviderTestContext(target, File(target.cacheDir, "coach-provider-test-${UUID.randomUUID()}"))
+        val context = IsolatedCoachTestContext(target, File(target.cacheDir, "coach-provider-test-${UUID.randomUUID()}"))
         val store = CoachStore(context)
         val settings = CoachProviderSettings(context)
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-        val auth = ChatGptAuth(context)
+        val session = OfflineCoachSession()
+        val oldFiles = mapOf(
+            "ai_coach_connection.json" to """{"url":"http://100.64.0.1:8765","token":"synthetic-old-token"}""",
+            "ai_coach_preferences.json" to """{"model":"legacy-only-model","effort":"high","modelName":"以前のPCモデル"}""",
+            "coach-provider.json" to """{"legacy":true,"preferences":{"model":"synthetic-model","effort":"low","modelName":"合成モデル"}}""",
+        )
         try {
-            val legacyPreferences = CoachPreferences("legacy-only-model", "high", "以前のPCモデル")
             withContext(Dispatchers.IO) {
-                store.writeConnection(CoachConnection("http://127.0.0.1:9", "synthetic-provider-token-1234567890"))
-                store.writePreferences(legacyPreferences)
+                oldFiles.forEach { (name, raw) -> File(context.noBackupFilesDir, name).writeText(raw) }
                 store.enqueue(CoachMessage("legacy-pending", "user", "保存済みの質問", 1L, "pending"),
                     JSONObject().put("requestId", "legacy-pending").put("message", "保存済みの質問"))
             }
-            val controller = CoachController(store, scope, auth, settings)
+            val controller = CoachController(store, scope, session, settings)
             withContext(Dispatchers.Main) { controller.load() }
-            assertFalse(controller.useLegacy)
-            assertFalse(controller.ready)
-            assertEquals(CoachPreferences(), controller.preferences)
-            assertEquals(legacyPreferences, withContext(Dispatchers.IO) { store.readPreferences() })
+            assertTrue(controller.ready)
+            assertTrue(controller.pendingRequiresDraft)
+            assertEquals(CoachPreferences("synthetic-model", "low", "合成モデル"), controller.preferences)
+            assertEquals(0, session.modelRequests)
+            assertTrue(session.requests.isEmpty())
             withContext(Dispatchers.Main) { controller.retry(emptyList()) }
             awaitIdle(controller)
-            assertTrue(controller.error.orEmpty().contains("別の接続方法"))
+            assertTrue(controller.error.orEmpty().contains("以前のPC接続"))
             assertNotNull(controller.conversation.pending)
             assertEquals(1, controller.conversation.messages.size)
-
-            withContext(Dispatchers.Main) { controller.setLegacy(true) }
-            awaitIdle(controller)
-            assertTrue(controller.useLegacy)
-            assertEquals(legacyPreferences, controller.preferences)
-            assertTrue(withContext(Dispatchers.IO) { CoachProviderSettings(context).usesLegacy() })
-            withContext(Dispatchers.Main) { controller.setLegacy(false) }
-            awaitIdle(controller)
-            assertEquals(CoachPreferences(), controller.preferences)
-            assertFalse(withContext(Dispatchers.IO) { CoachProviderSettings(context).usesLegacy() })
+            assertTrue(session.requests.isEmpty())
 
             withContext(Dispatchers.Main) { controller.returnPendingToDraft {} }
             awaitIdle(controller)
             assertEquals("保存済みの質問", controller.draft)
-            withContext(Dispatchers.Main) { controller.send(emptyList(), "2026.10.7", emptyList()) }
-            assertEquals("保存済みの質問", controller.draft)
-            assertTrue(controller.error.orEmpty().contains("ログイン"))
-            assertFalse(controller.sending)
-            assertEquals(legacyPreferences, withContext(Dispatchers.IO) { store.readPreferences() })
+            assertNull(controller.conversation.pending)
+            assertEquals("cancelled", controller.conversation.messages.single().status)
+            assertTrue(session.requests.isEmpty())
+            withContext(Dispatchers.IO) {
+                oldFiles.forEach { (name, raw) -> assertEquals(raw, File(context.noBackupFilesDir, name).readText()) }
+            }
         } finally {
             scope.cancel()
             store.close()
         }
     }
 
-    @Test fun pendingDirectQuestionRequiresItsOriginalAccountAndProvider() {
+    @Test fun pendingDirectQuestionRequiresItsOriginalAccountAndLegacyIsAlwaysRejected() {
         val question = JSONObject().put("_provider", "chatgpt").put("_account", "subject-a:client-a")
-        checkCoachRequestOwner(question, false, "subject-a:client-a", true)
-        checkCoachRequestOwner(JSONObject(), true, "", true) // Older pending relay questions remain retryable.
-        rejects { checkCoachRequestOwner(question, true, "subject-a:client-a", true) }
-        rejects { checkCoachRequestOwner(question, false, "subject-b:client-a", true) }
-        rejects { checkCoachRequestOwner(question, false, "subject-a:client-b", true) }
-        rejects { checkCoachRequestOwner(question, false, "subject-a:client-a", false) }
-        rejects { checkCoachRequestOwner(JSONObject(), false, "subject-a:client-a", true) }
-        rejects { checkCoachRequestOwner(JSONObject().put("_provider", "chatgpt"), false, "", true) }
+        checkCoachRequestOwner(question, "subject-a:client-a", true)
+        rejects { checkCoachRequestOwner(question, "subject-b:client-a", true) }
+        rejects { checkCoachRequestOwner(question, "subject-a:client-b", true) }
+        rejects { checkCoachRequestOwner(question, "subject-a:client-a", false) }
+        rejects { checkCoachRequestOwner(JSONObject(), "subject-a:client-a", true) }
+        rejects { checkCoachRequestOwner(JSONObject().put("_provider", "relay"), "subject-a:client-a", true) }
+        rejects { checkCoachRequestOwner(JSONObject().put("_provider", "chatgpt"), "", true) }
     }
 
-    @Test fun cancellingSignInDoesNotSendRecordsOrAllowProviderChangesDuringLogin() = runBlocking {
+    @Test fun cancellingSignInDoesNotFetchModelsOrSendRecords() = runBlocking {
         val target = InstrumentationRegistry.getInstrumentation().targetContext
-        val context = ProviderTestContext(target, File(target.cacheDir, "coach-cancel-test-${UUID.randomUUID()}"))
+        val context = IsolatedCoachTestContext(target, File(target.cacheDir, "coach-cancel-test-${UUID.randomUUID()}"))
         val store = CoachStore(context)
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-        val controller = CoachController(store, scope, ChatGptAuth(context), CoachProviderSettings(context))
+        val session = OfflineCoachSession(signedInAccount = null)
+        val controller = CoachController(store, scope, session, CoachProviderSettings(context))
         try {
             withContext(Dispatchers.Main) {
                 controller.load()
                 controller.draft = "まだ送らない質問"
-                controller.signIn { url ->
-                    assertTrue(url.startsWith("https://auth.openai.com/"))
-                    controller.setLegacy(true)
+                controller.signIn {
+                    assertTrue(controller.signingIn)
                     controller.refreshModels()
                     controller.send(emptyList(), "2026.10.7", emptyList())
                     controller.cancelSignIn()
                 }
             }
             awaitIdle(controller)
-            assertFalse(controller.useLegacy)
             assertFalse(controller.signingIn)
             assertFalse(controller.modelsLoading)
             assertNull(controller.account)
@@ -119,43 +109,48 @@ class CoachProviderInstrumentedTest {
             assertEquals("まだ送らない質問", controller.draft)
             assertTrue(controller.conversation.messages.isEmpty())
             assertNull(controller.conversation.pending)
+            assertTrue(session.requests.isEmpty())
+            assertEquals(0, session.modelRequests)
         } finally {
             scope.cancel()
             store.close()
         }
     }
 
-    @Test fun providerPreferencesPersistSeparatelyFromTheMode() {
+    @Test fun signedOutAccountCannotSendEvenWhenOldConnectionSettingsExist() = runBlocking {
         val target = InstrumentationRegistry.getInstrumentation().targetContext
-        val context = ProviderTestContext(target, File(target.cacheDir, "coach-provider-prefs-${UUID.randomUUID()}"))
-        val settings = CoachProviderSettings(context)
-        val selected = CoachPreferences("chatgpt-model", "low", "テストモデル")
-        assertFalse(settings.usesLegacy())
-        settings.setPreferences(selected)
-        settings.setLegacy(true)
-        assertEquals(selected, CoachProviderSettings(context).preferences())
-        settings.setLegacy(false)
-        assertEquals(selected, CoachProviderSettings(context).preferences())
+        val context = IsolatedCoachTestContext(target, File(target.cacheDir, "coach-signed-out-test-${UUID.randomUUID()}"))
+        File(context.noBackupFilesDir, "ai_coach_connection.json").writeText("""{"url":"https://old.tail123.ts.net","token":"synthetic-old-token"}""")
+        val store = CoachStore(context)
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+        val session = OfflineCoachSession(signedInAccount = null)
+        val controller = CoachController(store, scope, session, CoachProviderSettings(context))
+        try {
+            withContext(Dispatchers.Main) {
+                controller.load()
+                controller.draft = "まだ送れない質問"
+                controller.send(emptyList(), "2026.10.7", emptyList())
+                controller.refreshModels()
+            }
+            assertFalse(controller.ready)
+            assertTrue(controller.error.orEmpty().contains("ログイン"))
+            assertTrue(controller.modelsError.orEmpty().contains("ログイン"))
+            assertEquals("まだ送れない質問", controller.draft)
+            assertTrue(controller.conversation.messages.isEmpty())
+            assertTrue(session.requests.isEmpty())
+            assertEquals(0, session.modelRequests)
+        } finally {
+            scope.cancel()
+            store.close()
+        }
     }
 
     private fun rejects(action: () -> Unit) {
-        val problem = runCatching(action).exceptionOrNull()
-        assertTrue("Changing provider or account must reject the pending question", problem is IllegalStateException)
+        assertTrue("Changing provider or account must reject the pending question", runCatching(action).exceptionOrNull() is IllegalStateException)
     }
 
     private suspend fun awaitIdle(controller: CoachController) = withTimeout(5_000) {
         withContext(Dispatchers.Main) { /* Drain the preceding launch before inspecting state. */ }
         while (withContext(Dispatchers.Main) { controller.busy }) delay(20)
-    }
-
-    private class ProviderTestContext(base: Context, private val directory: File) : ContextWrapper(base) {
-        init { check(directory.mkdirs()) }
-        override fun getApplicationContext(): Context = this
-        override fun getNoBackupFilesDir(): File = File(directory, "no-backup").apply { mkdirs() }
-        override fun getDatabasePath(name: String): File = File(directory, name)
-        override fun openOrCreateDatabase(name: String, mode: Int, factory: SQLiteDatabase.CursorFactory?): SQLiteDatabase =
-            SQLiteDatabase.openOrCreateDatabase(getDatabasePath(name), factory)
-        override fun openOrCreateDatabase(name: String, mode: Int, factory: SQLiteDatabase.CursorFactory?, errorHandler: DatabaseErrorHandler?): SQLiteDatabase =
-            SQLiteDatabase.openOrCreateDatabase(getDatabasePath(name).absolutePath, factory, errorHandler)
     }
 }

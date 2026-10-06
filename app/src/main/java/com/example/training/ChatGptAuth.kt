@@ -28,11 +28,14 @@ import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketTimeoutException
+import java.net.UnknownHostException
 import java.net.URI
 import java.net.URL
 import java.net.URLDecoder
 import java.net.URLEncoder
 import java.security.KeyFactory
+import java.security.GeneralSecurityException
+import java.security.ProviderException
 import java.security.KeyStore
 import java.security.MessageDigest
 import java.security.SecureRandom
@@ -43,6 +46,7 @@ import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
+import javax.net.ssl.SSLException
 
 internal data class ChatGptAccount(
     val email: String,
@@ -54,8 +58,16 @@ internal data class ChatGptAccount(
 
 internal class ChatGptAuthException(val code: String, message: String) : IOException(message)
 
+internal fun interface ChatGptAuthTransport {
+    fun request(url: String, body: String?): JSONObject
+}
+
 /** Public-client OAuth. Tokens never leave this installation except for requests to OpenAI. */
-internal class ChatGptAuth(context: Context) {
+internal class ChatGptAuth(
+    context: Context,
+    private val transport: ChatGptAuthTransport? = null,
+    private val keyAlias: String = KEY_ALIAS
+) {
     private val lock = Any()
     private val directory = context.applicationContext.noBackupFilesDir
     private val file = AtomicFile(File(directory, "chatgpt_accounts.enc"))
@@ -136,6 +148,9 @@ internal class ChatGptAuth(context: Context) {
                 val requestEpoch: Long
                 val clientId: String
                 val hostId: String
+                var issuedRefreshToken = ""
+                var issuedClientId = ""
+                var credentialsSaved = false
                 try {
                     synchronized(lock) {
                         checkStorage()
@@ -179,6 +194,8 @@ internal class ChatGptAuth(context: Context) {
                         "code" to callback.code, "code_verifier" to verifier,
                         "redirect_uri" to redirectUri, "resource" to RESOURCE
                     ))
+                    issuedRefreshToken = tokens.optString("refresh_token")
+                    issuedClientId = callback.clientId
                     val idToken = tokens.optString("id_token")
                     val claims = verifyIdentity(idToken, callback.clientId, nonce)
                     if (previous != null && previous.account.subject != claims.getString("sub")) {
@@ -188,33 +205,34 @@ internal class ChatGptAuth(context: Context) {
                     val account = ChatGptAccount(claims.optString("email"), claims.getString("sub"),
                         callback.clientId, hostId, DIRECT_SCOPE in scopes)
                     val record = recordFromTokens(account, tokens, idToken, scopes)
-                    try {
-                        currentCoroutineContext().ensureActive()
-                        synchronized(lock) {
-                            checkEpoch(requestEpoch)
-                            val updated = records.filterNot { it.account.clientId == account.clientId } + record
-                            save(updated, account.clientId, "")
-                            records = updated
-                            selectedId = account.clientId
-                            pendingClientId = ""
-                        }
-                    } catch (error: Exception) {
-                        // A cancelled attempt or failed atomic save must not silently
-                        // abandon a newly issued renewable session.
-                        withContext(NonCancellable + Dispatchers.IO) { revoke(record, attempts = 1) }
-                        throw error
+                    currentCoroutineContext().ensureActive()
+                    synchronized(lock) {
+                        checkEpoch(requestEpoch)
+                        val updated = records.filterNot { it.account.clientId == account.clientId } + record
+                        save(updated, account.clientId, "")
+                        records = updated
+                        selectedId = account.clientId
+                        pendingClientId = ""
+                        credentialsSaved = true
                     }
                     account
                 } catch (error: CancellationException) {
                     throw error
                 } catch (error: ChatGptAuthException) {
                     throw error
-                } catch (_: Exception) {
+                } catch (error: Exception) {
                     if (server.isClosed) throw ChatGptAuthException("cancelled", "ログインを中止しました。")
-                    throw ChatGptAuthException("sign_in_failed", "ChatGPTに接続できませんでした。通信を確認して、もう一度ログインしてください。")
+                    throw safeAuthFailure("LOGIN", error)
                 } finally {
                     runCatching { server.close() }
                     synchronized(lock) { if (listener === server) listener = null }
+                    // Also cover validation/network failures after code exchange, not
+                    // only failures during the final save. Never adopt an unverified identity.
+                    if (!credentialsSaved && issuedRefreshToken.isNotBlank()) {
+                        withContext(NonCancellable + Dispatchers.IO) {
+                            revokeToken(issuedRefreshToken, issuedClientId, attempts = 1)
+                        }
+                    }
                 }
             }
         }
@@ -294,12 +312,16 @@ internal class ChatGptAuth(context: Context) {
 
     private suspend fun revoke(record: Record?, attempts: Int = 2): Boolean {
         if (record == null || record.refreshToken.isEmpty()) return true
+        return revokeToken(record.refreshToken, record.account.clientId, attempts)
+    }
+
+    private suspend fun revokeToken(refreshToken: String, clientId: String, attempts: Int): Boolean {
         repeat(attempts) { attempt ->
             try {
                 val discovery = getJson(DISCOVERY)
                 val endpoint = checkedAuthUrl(discovery.getString("revocation_endpoint"))
-                postForm(endpoint, mapOf("token" to record.refreshToken,
-                    "token_type_hint" to "refresh_token", "client_id" to record.account.clientId))
+                postForm(endpoint, mapOf("token" to refreshToken,
+                    "token_type_hint" to "refresh_token", "client_id" to clientId))
                 return true
             } catch (error: CancellationException) {
                 throw error
@@ -326,11 +348,11 @@ internal class ChatGptAuth(context: Context) {
         return Record(account, access, refresh, idToken, scopes, System.currentTimeMillis() + lifetime * 1000L)
     }
 
-    private fun verifyIdentity(idToken: String, clientId: String, nonce: String?): JSONObject {
+    private fun verifyIdentity(idToken: String, clientId: String, nonce: String?): JSONObject = authStep("IDENTITY") {
         val discovery = getJson(DISCOVERY)
         if (discovery.optString("issuer") != ISSUER) throw invalidIdentity()
         val jwks = getJson(checkedAuthUrl(discovery.getString("jwks_uri")))
-        return ChatGptJwt.verify(idToken, jwks, clientId, nonce)
+        ChatGptJwt.verify(idToken, jwks, clientId, nonce)
     }
 
     private suspend fun waitForCallback(server: ServerSocket, state: String, clientId: String): ChatGptOAuth.Callback {
@@ -418,20 +440,20 @@ internal class ChatGptAuth(context: Context) {
         if (storageFailure) throw ChatGptAuthException("storage_unavailable", "保存済みのChatGPT接続を読み取れませんでした。既存の接続情報は保持しています。")
     }
 
-    private fun loadHostId(): String {
+    private fun loadHostId(): String = authStep("STORAGE") {
         if (atomicExists(hostFile)) {
             val id = hostFile.openRead().bufferedReader(Charsets.UTF_8).use { it.readText() }.trim()
             if (!id.startsWith("urn:uuid:") || runCatching { UUID.fromString(id.removePrefix("urn:uuid:")) }.isFailure) {
                 throw ChatGptAuthException("storage_unavailable", "端末のChatGPT接続情報を読み取れませんでした。")
             }
-            return id
+            return@authStep id
         }
         val value = "urn:uuid:${UUID.randomUUID()}"
         atomicWrite(hostFile, value.toByteArray(Charsets.UTF_8))
-        return value
+        value
     }
 
-    private fun save(profiles: List<Record>, selected: String, pending: String) {
+    private fun save(profiles: List<Record>, selected: String, pending: String) = authStep("STORAGE") {
         val array = JSONArray()
         profiles.forEach { record ->
             array.put(JSONObject().put("email", record.account.email).put("subject", record.account.subject)
@@ -446,9 +468,9 @@ internal class ChatGptAuth(context: Context) {
 
     private fun key(): SecretKey {
         val store = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
-        (store.getKey(KEY_ALIAS, null) as? SecretKey)?.let { return it }
+        (store.getKey(keyAlias, null) as? SecretKey)?.let { return it }
         return KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore").apply {
-            init(KeyGenParameterSpec.Builder(KEY_ALIAS, KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)
+            init(KeyGenParameterSpec.Builder(keyAlias, KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)
                 .setBlockModes(KeyProperties.BLOCK_MODE_GCM).setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
                 .setRandomizedEncryptionRequired(true).build())
         }.generateKey()
@@ -482,6 +504,19 @@ internal class ChatGptAuth(context: Context) {
     private fun postForm(url: String, parameters: Map<String, String>): JSONObject = request(url, form(parameters))
 
     private fun request(url: String, body: String?): JSONObject {
+        val stage = when (url) {
+            TOKEN -> "TOKEN"
+            DISCOVERY -> "DISCOVERY"
+            "$ISSUER/.well-known/jwks.json" -> "JWKS"
+            else -> "AUTH"
+        }
+        return authStep(stage) {
+            val checkedUrl = checkedAuthUrl(url)
+            transport?.request(checkedUrl, body) ?: httpRequest(checkedUrl, body)
+        }
+    }
+
+    private fun httpRequest(url: String, body: String?): JSONObject {
         val connection = URL(checkedAuthUrl(url)).openConnection() as HttpURLConnection
         try {
             connection.connectTimeout = 15_000
@@ -519,6 +554,38 @@ internal class ChatGptAuth(context: Context) {
             }
             return json
         } finally { connection.disconnect() }
+    }
+
+    private inline fun <T> authStep(stage: String, action: () -> T): T = try {
+        action()
+    } catch (error: CancellationException) {
+        throw error
+    } catch (error: ChatGptAuthException) {
+        throw error
+    } catch (error: Exception) {
+        throw safeAuthFailure(stage, error)
+    }
+
+    private fun safeAuthFailure(stage: String, error: Exception): ChatGptAuthException {
+        // Only fixed categories are shown. Exception text can contain URLs,
+        // authorization codes or credentials, so never display or log it.
+        val category = when (error) {
+            is UnknownHostException -> "DNS"
+            is SSLException -> "TLS"
+            is SocketTimeoutException -> "TIMEOUT"
+            is GeneralSecurityException, is ProviderException -> "KEYSTORE"
+            is SecurityException -> "PERMISSION"
+            is IOException -> "IO"
+            is org.json.JSONException -> "RESPONSE"
+            else -> "INTERNAL"
+        }
+        val code = "AUTH-$stage-$category"
+        val message = when (stage) {
+            "STORAGE" -> "ChatGPTの接続情報を端末に保存できませんでした。記録は消さず、アプリを開き直してお試しください。"
+            "DISCOVERY", "JWKS", "IDENTITY" -> "ChatGPTの本人確認に必要な情報を取得できませんでした。もう一度ログインしてください。"
+            else -> "ChatGPTのログイン処理を完了できませんでした。通信を確認して、もう一度ログインしてください。"
+        }
+        return ChatGptAuthException(code, "$message（$code）")
     }
 
     companion object {

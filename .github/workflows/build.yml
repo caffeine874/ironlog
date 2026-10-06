@@ -34,14 +34,3 @@ jobs:
             -dname "CN=Android Debug,O=Android,C=US"
       - name: Build debug app and run unit tests
         run: bash ./gradlew --no-daemon -PironlogDebugKeystore="$RUNNER_TEMP/ironlog-ci-debug.keystore" testDebugUnitTest assembleDebug
-
-  legacy-relay:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-      - name: Test optional PC relay
-        working-directory: coach-relay
-        run: npm test
