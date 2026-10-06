@@ -41,6 +41,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -49,6 +50,9 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.withResumed
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -98,10 +102,13 @@ internal interface CoachChatGptSession {
     suspend fun chat(body: JSONObject): JSONObject
 }
 
-internal class DirectCoachChatGptSession(private val auth: ChatGptAuth) : CoachChatGptSession {
+internal class DirectCoachChatGptSession(
+    private val auth: ChatGptAuth,
+    private val awaitForeground: suspend () -> Unit,
+) : CoachChatGptSession {
     private val client = ChatGptClient(auth)
     override fun account(): ChatGptAccount? = auth.account()
-    override suspend fun signIn(openBrowser: (String) -> Unit): ChatGptAccount = auth.signIn(openBrowser)
+    override suspend fun signIn(openBrowser: (String) -> Unit): ChatGptAccount = auth.signIn(openBrowser, awaitForeground)
     override fun cancelSignIn() = auth.cancelSignIn()
     override suspend fun signOutAndRevoke(): Boolean = auth.signOutAndRevoke()
     override suspend fun models(): CoachModelCatalog = client.models()
@@ -475,14 +482,22 @@ internal fun checkCoachRequestOwner(body: JSONObject, accountIdentity: String, r
     }
 }
 
+internal suspend fun awaitCoachForeground(lifecycle: Lifecycle) {
+    withContext(Dispatchers.Main.immediate) { lifecycle.withResumed {} }
+}
+
 @Composable
 internal fun rememberCoachController(context: Context): CoachController {
     val scope = rememberCoroutineScope()
+    val currentLifecycle = rememberUpdatedState(LocalLifecycleOwner.current.lifecycle)
     val store = remember(context.applicationContext) { CoachStore(context.applicationContext) }
     val auth = remember(context.applicationContext) { ChatGptAuth.get(context.applicationContext) }
     val providerSettings = remember(context.applicationContext) { CoachProviderSettings(context.applicationContext) }
     val controller = remember(store, scope, auth, providerSettings) {
-        CoachController(store, scope, DirectCoachChatGptSession(auth), providerSettings)
+        CoachController(store, scope, DirectCoachChatGptSession(auth) {
+            // Read the current owner when OAuth returns, without capturing an old Activity.
+            awaitCoachForeground(currentLifecycle.value)
+        }, providerSettings)
     }
     LaunchedEffect(controller) { controller.load() }
     DisposableEffect(store) { onDispose { store.close() } }

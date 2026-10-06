@@ -8,8 +8,11 @@ import android.security.keystore.KeyProperties
 import android.util.Base64
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
@@ -40,6 +43,8 @@ import java.security.MessageDigest
 import java.security.Signature
 import java.security.interfaces.RSAPublicKey
 import java.util.UUID
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import javax.crypto.KeyGenerator
 import javax.net.ssl.SSLHandshakeException
 
@@ -124,6 +129,7 @@ class ChatGptAuthInstrumentedTest {
                 assertSafeFailure(expectedCode, authFailure { fixture.signIn(auth) })
                 assertNull(auth.account())
                 assertTrue(fixture.pendingWasSaved)
+                assertEquals("A one-use authorization code must never be replayed", 1, fixture.authorizationExchanges)
             }
         }
     }
@@ -139,7 +145,8 @@ class ChatGptAuthInstrumentedTest {
             val auth = fixture.auth()
             assertSafeFailure("AUTH-STORAGE-KEYSTORE", authFailure { fixture.signIn(auth) })
             assertNull(auth.account())
-            assertEquals("No token request may occur when pending storage fails", 0, fixture.requests)
+            assertEquals("Only the public preflight may run when pending storage fails", 1, fixture.requests)
+            assertEquals("No token request may occur when pending storage fails", 0, fixture.authorizationExchanges)
         }
     }
 
@@ -160,7 +167,8 @@ class ChatGptAuthInstrumentedTest {
             }
             assertSafeFailure("AUTH-STORAGE-IO", error)
             assertNull(auth.account())
-            assertEquals("No token request may occur when pending storage fails", 0, fixture.requests)
+            assertEquals("Only the public preflight may run when pending storage fails", 1, fixture.requests)
+            assertEquals("No token request may occur when pending storage fails", 0, fixture.authorizationExchanges)
         }
     }
 
@@ -171,6 +179,154 @@ class ChatGptAuthInstrumentedTest {
             val error = authFailure { fixture.signIn(fixture.auth()) }
             assertEquals("invalid_grant", error.code)
             assertEquals("認証期限が切れました。", error.message)
+            assertEquals("An invalid code must never be replayed", 1, fixture.authorizationExchanges)
+        }
+    }
+
+    @Test
+    fun tokenExchangeWaitsForForegroundAfterAcceptingTheCallback() = runBlocking {
+        Fixture().use { fixture ->
+            val auth = fixture.auth()
+            val gateEntered = CompletableDeferred<Unit>()
+            val resume = CompletableDeferred<Unit>()
+            val attempt = async {
+                fixture.signIn(auth, awaitForeground = {
+                    gateEntered.complete(Unit)
+                    resume.await()
+                })
+            }
+            try {
+                withTimeout(5000L) { gateEntered.await() }
+                assertEquals(1, fixture.browserOpens)
+                assertTrue("Issued client ID must survive while waiting for foreground", fixture.accountFile.isFile)
+                assertEquals("Background wait must not make another public request", 1, fixture.discoveryRequests)
+                assertEquals("A callback alone must not start the code exchange", 0, fixture.authorizationExchanges)
+                assertNull(auth.account())
+                resume.complete(Unit)
+                assertEquals(SUBJECT, attempt.await().subject)
+                assertEquals(1, fixture.authorizationExchanges)
+            } finally {
+                attempt.cancelAndJoin()
+            }
+        }
+    }
+
+    @Test
+    fun cancellationWhileAwaitingForegroundPreventsEveryFurtherRequest() = runBlocking {
+        Fixture().use { fixture ->
+            val auth = fixture.auth()
+            val gateEntered = CompletableDeferred<Unit>()
+            val resume = CompletableDeferred<Unit>()
+            val attempt = async {
+                authFailure {
+                    fixture.signIn(auth, awaitForeground = {
+                        gateEntered.complete(Unit)
+                        resume.await()
+                    })
+                }
+            }
+            try {
+                withTimeout(5000L) { gateEntered.await() }
+                auth.cancelSignIn()
+                resume.complete(Unit)
+                assertEquals("cancelled", attempt.await().code)
+                assertEquals(1, fixture.discoveryRequests)
+                assertEquals(0, fixture.authorizationExchanges)
+                assertNull(auth.account())
+            } finally {
+                attempt.cancelAndJoin()
+            }
+        }
+    }
+
+    @Test
+    fun cancellationDuringInitialPreflightDoesNotOpenTheBrowserAfterTheGetCompletes() = runBlocking {
+        Fixture().use { fixture ->
+            val preflightEntered = CompletableDeferred<Unit>()
+            val releasePreflight = CountDownLatch(1)
+            fixture.discoveryFailure = { _, _ ->
+                preflightEntered.complete(Unit)
+                assertTrue("Synthetic public GET must be released by the test", releasePreflight.await(5, TimeUnit.SECONDS))
+                null
+            }
+            val auth = fixture.auth()
+            val attempt = async { authFailure { fixture.signIn(auth) } }
+            try {
+                withTimeout(5000L) { preflightEntered.await() }
+                auth.cancelSignIn()
+                releasePreflight.countDown()
+                assertEquals("cancelled", attempt.await().code)
+                assertEquals(1, fixture.discoveryRequests)
+                assertEquals("A cancelled attempt must never launch a browser", 0, fixture.browserOpens)
+                assertEquals(0, fixture.authorizationExchanges)
+                assertFalse(fixture.accountFile.exists())
+                assertNull(auth.account())
+            } finally {
+                releasePreflight.countDown()
+                attempt.cancelAndJoin()
+            }
+        }
+    }
+
+    @Test
+    fun persistentDnsPreflightFailureStopsBeforeOpeningTheBrowser() = runBlocking {
+        Fixture().use { fixture ->
+            fixture.discoveryFailure = { _, _ -> UnknownHostException(RAW_ERROR_SENTINEL) }
+            val auth = fixture.auth()
+            assertSafeFailure("AUTH-DISCOVERY-DNS", authFailure { fixture.signIn(auth) })
+            assertEquals("Only three public DNS attempts are allowed", 3, fixture.discoveryRequests)
+            assertEquals(0, fixture.browserOpens)
+            assertEquals(0, fixture.authorizationExchanges)
+            assertFalse(fixture.accountFile.exists())
+            assertNull(auth.account())
+        }
+    }
+
+    @Test
+    fun transientDnsPreflightFailureCanRecoverWithoutRepeatingBrowserConsent() = runBlocking {
+        Fixture().use { fixture ->
+            fixture.discoveryFailure = { number, _ -> if (number == 1) UnknownHostException(RAW_ERROR_SENTINEL) else null }
+            val account = fixture.signIn(fixture.auth())
+            assertEquals(SUBJECT, account.subject)
+            assertEquals(1, fixture.browserOpens)
+            assertEquals(1, fixture.authorizationExchanges)
+            assertEquals("One retry plus foreground and identity metadata requests", 4, fixture.discoveryRequests)
+        }
+    }
+
+    @Test
+    fun nonDnsPreflightFailuresAreNeverRetried() = runBlocking {
+        listOf(
+            SSLHandshakeException(RAW_ERROR_SENTINEL) to "AUTH-DISCOVERY-TLS",
+            SocketTimeoutException(RAW_ERROR_SENTINEL) to "AUTH-DISCOVERY-TIMEOUT",
+            IOException(RAW_ERROR_SENTINEL) to "AUTH-DISCOVERY-IO"
+        ).forEach { (failure, expectedCode) ->
+            Fixture().use { fixture ->
+                fixture.discoveryFailure = { _, _ -> failure }
+                assertSafeFailure(expectedCode, authFailure { fixture.signIn(fixture.auth()) })
+                assertEquals(1, fixture.discoveryRequests)
+                assertEquals(0, fixture.browserOpens)
+                assertEquals(0, fixture.authorizationExchanges)
+            }
+        }
+    }
+
+    @Test
+    fun dnsFailureAfterForegroundPreservesPendingClientButNeverExchangesCode() = runBlocking {
+        Fixture().use { fixture ->
+            fixture.discoveryFailure = { _, browserOpens -> if (browserOpens > 0) UnknownHostException(RAW_ERROR_SENTINEL) else null }
+            val auth = fixture.auth()
+            var foregroundChecks = 0
+            assertSafeFailure("AUTH-DISCOVERY-DNS", authFailure {
+                fixture.signIn(auth, awaitForeground = { foregroundChecks++ })
+            })
+            assertEquals(1, foregroundChecks)
+            assertEquals(1, fixture.browserOpens)
+            assertEquals("One initial preflight followed by three foreground DNS attempts", 4, fixture.discoveryRequests)
+            assertEquals(0, fixture.authorizationExchanges)
+            assertEquals(0, fixture.revocations)
+            assertEncrypted(fixture.accountFile)
+            assertNull(fixture.auth().account())
         }
     }
 
@@ -252,6 +408,9 @@ class ChatGptAuthInstrumentedTest {
         val accountFile: File get() = File(context.noBackupFilesDir, "chatgpt_accounts.enc")
         private val pair = KeyPairGenerator.getInstance("RSA").apply { initialize(2048) }.generateKeyPair()
         @Volatile var authorizeParameters = emptyMap<String, String>()
+        @Volatile var browserOpens = 0
+        @Volatile var discoveryRequests = 0
+        @Volatile var discoveryFailure: ((Int, Int) -> Exception?)? = null
         @Volatile var tokenFailure: Exception? = null
         @Volatile var jwksFailure: Exception? = null
         @Volatile var initialLifetime = 3600L
@@ -267,11 +426,13 @@ class ChatGptAuthInstrumentedTest {
         suspend fun signIn(
             auth: ChatGptAuth,
             invalidCallbacksFirst: Boolean = false,
-            beforeCallback: () -> Unit = {}
+            beforeCallback: () -> Unit = {},
+            awaitForeground: suspend () -> Unit = {}
         ): ChatGptAccount = withTimeout(20_000L) {
             coroutineScope {
                 var callbackJob: Job? = null
-                val account = auth.signIn { authorizationUrl ->
+                val account = auth.signIn(openBrowser = { authorizationUrl ->
+                    browserOpens++
                     assertEquals(Looper.getMainLooper(), Looper.myLooper())
                     val uri = URI(authorizationUrl)
                     assertEquals("https", uri.scheme)
@@ -292,7 +453,7 @@ class ChatGptAuthInstrumentedTest {
                         val issuedClient = if (values.getValue("client_id") == "dynamic_agent_client") "&client_id=$CLIENT_ID" else ""
                         callbackStatuses += sendCallback(redirect, "state=${encodeQuery(state)}&code=$AUTHORIZATION_CODE$issuedClient")
                     }
-                }
+                }, awaitForeground = awaitForeground)
                 assertNotNull(callbackJob)
                 callbackJob?.join()
                 account
@@ -340,6 +501,8 @@ class ChatGptAuthInstrumentedTest {
                 }
                 "$ISSUER/.well-known/openid-configuration" -> {
                     assertNull(body)
+                    discoveryRequests++
+                    discoveryFailure?.invoke(discoveryRequests, browserOpens)?.let { throw it }
                     JSONObject().put("issuer", ISSUER).put("jwks_uri", "$ISSUER/.well-known/jwks.json")
                         .put("revocation_endpoint", "$ISSUER/test-revoke")
                 }

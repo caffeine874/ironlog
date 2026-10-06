@@ -34,7 +34,7 @@ GitHub Actions はビルドとテストを実行します。個人の署名鍵�
 
 ## 既存アプリの更新
 
-アプリ ID は `com.example.training`、バージョンは 1.13（versionCode 14）です。既存の筋トレ記録 DB を維持します。
+アプリ ID は `com.example.training`、バージョンは 1.14（versionCode 15）です。既存の筋トレ記録 DB を維持します。
 
 すでにインストールしたアプリを更新する場合は、同じ署名鍵を使用してください。Gradle の `-PironlogDebugKeystore=鍵の絶対パス`、または `IRONLOG_DEBUG_KEYSTORE` 環境変数で指定できます。指定がない Windows 環境では `%USERPROFILE%/.android/debug.keystore` を使用します。他の環境ではユーザーのホームにある `.android/debug.keystore` を使用します。
 

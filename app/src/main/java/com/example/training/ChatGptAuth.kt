@@ -17,6 +17,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
@@ -132,11 +133,21 @@ internal class ChatGptAuth(
         selectedId = clientId
     }
 
-    suspend fun signIn(openBrowser: (String) -> Unit): ChatGptAccount = authorize(false, openBrowser)
+    suspend fun signIn(openBrowser: (String) -> Unit): ChatGptAccount = authorize(false, openBrowser) {}
 
-    suspend fun signInNew(openBrowser: (String) -> Unit): ChatGptAccount = authorize(true, openBrowser)
+    suspend fun signIn(openBrowser: (String) -> Unit, awaitForeground: suspend () -> Unit): ChatGptAccount =
+        authorize(false, openBrowser, awaitForeground)
 
-    private suspend fun authorize(newAccount: Boolean, openBrowser: (String) -> Unit): ChatGptAccount =
+    suspend fun signInNew(openBrowser: (String) -> Unit): ChatGptAccount = authorize(true, openBrowser) {}
+
+    suspend fun signInNew(openBrowser: (String) -> Unit, awaitForeground: suspend () -> Unit): ChatGptAccount =
+        authorize(true, openBrowser, awaitForeground)
+
+    private suspend fun authorize(
+        newAccount: Boolean,
+        openBrowser: (String) -> Unit,
+        awaitForeground: suspend () -> Unit
+    ): ChatGptAccount =
         signInMutex.withLock {
             withContext(Dispatchers.IO) {
                 val server = ServerSocket().apply {
@@ -162,6 +173,9 @@ internal class ChatGptAuth(
                             ?: pendingClientId.takeIf { !newAccount && it.isNotBlank() } ?: DYNAMIC_CLIENT
                         hostId = loadHostId()
                     }
+                    // Check public connectivity while our activity is visible, before
+                    // asking the user to repeat browser consent on a broken connection.
+                    checkAuthConnectivity(requestEpoch)
                     val state = randomValue()
                     val nonce = randomValue()
                     val verifier = randomValue(64)
@@ -180,7 +194,11 @@ internal class ChatGptAuth(
                     if (previous?.idToken?.isNotEmpty() == true && !previous.account.planUsageEnabled) {
                         parameters["prompt"] = "consent"
                     }
-                    withContext(Dispatchers.Main) { openBrowser("$AUTHORIZE?${form(parameters)}") }
+                    withContext(Dispatchers.Main) {
+                        currentCoroutineContext().ensureActive()
+                        synchronized(lock) { checkEpoch(requestEpoch) }
+                        openBrowser("$AUTHORIZE?${form(parameters)}")
+                    }
                     val callback = waitForCallback(server, state, clientId)
                     synchronized(lock) {
                         checkEpoch(requestEpoch)
@@ -189,6 +207,14 @@ internal class ChatGptAuth(
                             pendingClientId = callback.clientId
                         }
                     }
+                    // Some Android devices deny background network access while the
+                    // system browser is in front. Resume the activity before exchanging
+                    // a one-use code; never retry the code POST after an ambiguous failure.
+                    val resumed = withTimeoutOrNull(120_000L) { awaitForeground(); true } == true
+                    if (!resumed) throw ChatGptAuthException("return_to_app", "IronLogに戻って、もう一度ログインしてください。")
+                    checkAuthConnectivity(requestEpoch)
+                    currentCoroutineContext().ensureActive()
+                    synchronized(lock) { checkEpoch(requestEpoch) }
                     val tokens = postForm(TOKEN, mapOf(
                         "grant_type" to "authorization_code", "client_id" to callback.clientId,
                         "code" to callback.code, "code_verifier" to verifier,
@@ -236,6 +262,23 @@ internal class ChatGptAuth(
                 }
             }
         }
+
+    private suspend fun checkAuthConnectivity(requestEpoch: Long) {
+        for (attempt in 0..2) {
+            currentCoroutineContext().ensureActive()
+            synchronized(lock) { checkEpoch(requestEpoch) }
+            try {
+                val metadata = getJson(DISCOVERY)
+                if (metadata.optString("issuer") != ISSUER) throw invalidIdentity()
+                return
+            } catch (error: ChatGptAuthException) {
+                if (error.code != "AUTH-DISCOVERY-DNS" || attempt == 2) throw error
+                // Only this public GET may be retried. No code, token, host ID,
+                // email or workout data is part of the connectivity check.
+                delay(if (attempt == 0) 1_000L else 3_000L)
+            }
+        }
+    }
 
     suspend fun accessToken(): String = withContext(Dispatchers.IO) {
         refreshMutex.withLock {
@@ -525,10 +568,14 @@ internal class ChatGptAuth(
             connection.setRequestProperty("Accept", "application/json")
             connection.setRequestProperty("User-Agent", "IronLog-Android")
             if (body != null) {
+                val requestBytes = body.toByteArray(Charsets.UTF_8)
                 connection.requestMethod = "POST"
                 connection.doOutput = true
                 connection.setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
-                connection.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+                // Disable HttpURLConnection's buffered-body replay for one-use codes
+                // and rotating refresh tokens after an ambiguous transport failure.
+                connection.setFixedLengthStreamingMode(requestBytes.size)
+                connection.outputStream.use { it.write(requestBytes) }
             }
             val status = connection.responseCode
             val input = if (status in 200..299) connection.inputStream else connection.errorStream
@@ -580,7 +627,9 @@ internal class ChatGptAuth(
             else -> "INTERNAL"
         }
         val code = "AUTH-$stage-$category"
-        val message = when (stage) {
+        val message = if (category == "DNS") {
+            "認証サーバーのアドレスを確認できませんでした。Wi-Fiとモバイル通信を切り替えてお試しください。続く場合は端末のIRON LOGの通信許可を確認してください。"
+        } else when (stage) {
             "STORAGE" -> "ChatGPTの接続情報を端末に保存できませんでした。記録は消さず、アプリを開き直してお試しください。"
             "DISCOVERY", "JWKS", "IDENTITY" -> "ChatGPTの本人確認に必要な情報を取得できませんでした。もう一度ログインしてください。"
             else -> "ChatGPTのログイン処理を完了できませんでした。通信を確認して、もう一度ログインしてください。"
